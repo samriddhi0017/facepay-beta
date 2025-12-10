@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
@@ -42,39 +41,43 @@ class _DebugViewState extends State<DebugView> {
   }
 
   Future<void> _initializeCamera() async {
-    print('🚀 INIT: Starting camera initialization...');
-    
     final cameras = await availableCameras();
-    print('🚀 INIT: Found ${cameras.length} cameras');
     
-    final frontCamera = cameras.firstWhere(
-      (camera) => camera.lensDirection == CameraLensDirection.front,
-    );
-    print('🚀 INIT: Selected front camera: ${frontCamera.name}');
+    if (cameras.isEmpty) {
+      // No cameras available
+      return;
+    }
+    
+    // Try to find front camera, fallback to first available camera
+    CameraDescription selectedCamera;
+    try {
+      selectedCamera = cameras.firstWhere(
+        (camera) => camera.lensDirection == CameraLensDirection.front,
+      );
+    } catch (e) {
+      // No front camera found, use first available (for emulators)
+      selectedCamera = cameras.first;
+    }
 
-    _cameraDescription = frontCamera;
+    _cameraDescription = selectedCamera;
 
     _camera = CameraController(
-      frontCamera,
+      selectedCamera,
       ResolutionPreset.medium,
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.nv21,
     );
 
-    print('🚀 INIT: Initializing camera controller...');
     await _camera!.initialize();
-    print('🚀 INIT: Camera controller initialized');
 
     if (mounted) {
       setState(() {});
-      print('🚀 INIT: Starting image stream...');
       await _camera!.startImageStream((image) {
         _latestImage = image;
         if (_isDetecting) return;
         _isDetecting = true;
         _detectFaces(image);
       });
-      print('🚀 INIT: Image stream started successfully');
     }
   }
 
@@ -120,7 +123,7 @@ class _DebugViewState extends State<DebugView> {
         }
       }
     } catch (e) {
-      print('❌ Detection error: $e');
+      // Silent catch for detection errors
     }
 
     _isDetecting = false;
@@ -153,24 +156,33 @@ class _DebugViewState extends State<DebugView> {
       double bestDistance = double.infinity;
       Student? bestMatch;
 
+      print('🔍 Comparing against ${box.values.length} enrolled students');
+      
       for (var student in box.values) {
         final distance = TFLiteService.euclideanDistance(
           embedding,
           student.faceEmbedding,
         );
+        
+        print('🔍 Distance to ${student.name}: ${distance.toStringAsFixed(4)}');
 
         if (distance < bestDistance) {
           bestDistance = distance;
           bestMatch = student;
         }
       }
+      
+      print('🔍 Best match: ${bestMatch?.name} with distance: ${bestDistance.toStringAsFixed(4)}');
 
-      // Always show the nearest match - no threshold
-      if (bestMatch != null) {
+      // Threshold for face matching
+      // For normalized embeddings, distance < 1.0 is typically a good match
+      // Lower threshold = stricter matching
+      const double matchThreshold = 1.0;
+      
+      if (bestMatch != null && bestDistance < matchThreshold) {
         // Convert distance to confidence percentage
         // Lower distance = higher confidence
-        // Distance typically ranges 0-2 for normalized embeddings
-        final confidence = (1.0 - (bestDistance / 2.0)).clamp(0.0, 1.0);
+        final confidence = (1.0 - (bestDistance / 1.5)).clamp(0.0, 1.0);
         
         if (mounted) {
           setState(() {
@@ -179,16 +191,17 @@ class _DebugViewState extends State<DebugView> {
           });
         }
       } else {
+        // No match found - unknown person
         if (mounted) {
           setState(() {
-            _matchedName = null;
+            _matchedName = "Unknown";
             _matchConfidence = null;
           });
         }
       }
       
     } catch (e) {
-      print('❌ Realtime verification error: $e');
+      // Silent catch - realtime verification errors are expected occasionally
     } finally {
       _isVerifyingRealtime = false;
     }
@@ -242,7 +255,7 @@ class _DebugViewState extends State<DebugView> {
     } catch (e) {
       setState(() {
         _isEnrolling = false;
-        _statusMessage = '❌ Error: $e';
+        _statusMessage = '❌ Enrollment failed';
       });
     }
   }
@@ -291,18 +304,18 @@ class _DebugViewState extends State<DebugView> {
         }
       }
 
-      final threshold = 1.2; // Same threshold as realtime
+      final threshold = 1.0; // Same threshold as realtime
 
       if (bestMatch != null && bestDistance < threshold) {
         setState(() {
           _isVerifying = false;
-          final confidence = ((1.0 - (bestDistance / 2.0)) * 100).clamp(0.0, 100.0);
+          final confidence = ((1.0 - (bestDistance / 1.5)) * 100).clamp(0.0, 100.0);
           _statusMessage = '✅ Matched: ${bestMatch!.name}\nDistance: ${bestDistance.toStringAsFixed(3)}\nConfidence: ${confidence.toStringAsFixed(1)}%';
         });
       } else {
         setState(() {
           _isVerifying = false;
-          _statusMessage = '❌ No match found\nBest distance: ${bestDistance.toStringAsFixed(3)}';
+          _statusMessage = '❌ Unknown person\nNearest distance: ${bestDistance.toStringAsFixed(3)}\n(threshold: $threshold)';
         });
       }
       
@@ -314,48 +327,111 @@ class _DebugViewState extends State<DebugView> {
     }
   }
 
-  Future<img.Image> _cropFaceFromCamera(CameraImage cameraImage, Face face) async {
-    // Convert NV21 to RGB (proper color conversion)
-    final imgLib = img.Image(
-      width: cameraImage.width,
-      height: cameraImage.height,
+  Future<void> _clearAllEnrollments() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clear All Enrollments?'),
+        content: const Text('This will delete all enrolled faces. This action cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('Delete All'),
+          ),
+        ],
+      ),
     );
 
-    final yPlane = cameraImage.planes[0].bytes;
-    final uvPlane = cameraImage.planes[1].bytes;
+    if (confirm == true) {
+      final box = await Hive.openBox<Student>('students');
+      await box.clear();
+      setState(() {
+        _statusMessage = '🗑️ All enrollments cleared';
+        _matchedName = null;
+        _matchConfidence = null;
+      });
+    }
+  }
+
+  Future<img.Image> _cropFaceFromCamera(CameraImage cameraImage, Face face) async {
+    final width = cameraImage.width;
+    final height = cameraImage.height;
     
-    for (int y = 0; y < cameraImage.height; y++) {
-      for (int x = 0; x < cameraImage.width; x++) {
-        final yIndex = y * cameraImage.planes[0].bytesPerRow + x;
-        final uvIndex = (y ~/ 2) * cameraImage.planes[1].bytesPerRow + (x ~/ 2) * 2;
-        
-        final yValue = yPlane[yIndex];
-        final uValue = uvPlane[uvIndex] - 128;
-        final vValue = uvPlane[uvIndex + 1] - 128;
-        
-        // YUV to RGB conversion
-        int r = (yValue + 1.402 * vValue).clamp(0, 255).toInt();
-        int g = (yValue - 0.344136 * uValue - 0.714136 * vValue).clamp(0, 255).toInt();
-        int b = (yValue + 1.772 * uValue).clamp(0, 255).toInt();
-        
-        imgLib.setPixelRgb(x, y, r, g, b);
+    // Create output image
+    final imgLib = img.Image(width: width, height: height);
+
+    final yPlane = cameraImage.planes[0].bytes;
+    final yRowStride = cameraImage.planes[0].bytesPerRow;
+    
+    // Check if we have UV plane (NV21 format)
+    if (cameraImage.planes.length > 1) {
+      final uvPlane = cameraImage.planes[1].bytes;
+      final uvRowStride = cameraImage.planes[1].bytesPerRow;
+      
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          // Y plane index
+          final yIndex = y * yRowStride + x;
+          if (yIndex >= yPlane.length) continue;
+          
+          // UV plane index - NV21 has interleaved VU pairs
+          final uvIndex = (y ~/ 2) * uvRowStride + (x & ~1);
+          
+          final yValue = yPlane[yIndex];
+          int uValue = 0;
+          int vValue = 0;
+          
+          // Safe UV access
+          if (uvIndex < uvPlane.length) {
+            vValue = uvPlane[uvIndex] - 128;
+          }
+          if (uvIndex + 1 < uvPlane.length) {
+            uValue = uvPlane[uvIndex + 1] - 128;
+          }
+          
+          // YUV to RGB conversion
+          int r = (yValue + 1.402 * vValue).round().clamp(0, 255);
+          int g = (yValue - 0.344136 * uValue - 0.714136 * vValue).round().clamp(0, 255);
+          int b = (yValue + 1.772 * uValue).round().clamp(0, 255);
+          
+          imgLib.setPixelRgb(x, y, r, g, b);
+        }
+      }
+    } else {
+      // Grayscale fallback if no UV plane
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final yIndex = y * yRowStride + x;
+          if (yIndex >= yPlane.length) continue;
+          final yValue = yPlane[yIndex];
+          imgLib.setPixelRgb(x, y, yValue, yValue, yValue);
+        }
       }
     }
 
     // Crop face region with padding
     final box = face.boundingBox;
     final padding = 20;
-    final left = (box.left - padding).clamp(0, cameraImage.width - 1).toInt();
-    final top = (box.top - padding).clamp(0, cameraImage.height - 1).toInt();
-    final right = (box.right + padding).clamp(0, cameraImage.width - 1).toInt();
-    final bottom = (box.bottom + padding).clamp(0, cameraImage.height - 1).toInt();
+    final left = (box.left - padding).clamp(0, width - 1).toInt();
+    final top = (box.top - padding).clamp(0, height - 1).toInt();
+    final right = (box.right + padding).clamp(0, width - 1).toInt();
+    final bottom = (box.bottom + padding).clamp(0, height - 1).toInt();
+    
+    // Ensure valid crop dimensions
+    final cropWidth = (right - left).clamp(1, width);
+    final cropHeight = (bottom - top).clamp(1, height);
 
     return img.copyCrop(
       imgLib,
       x: left,
       y: top,
-      width: right - left,
-      height: bottom - top,
+      width: cropWidth,
+      height: cropHeight,
     );
   }
 
@@ -510,9 +586,13 @@ class _DebugViewState extends State<DebugView> {
                   if (_statusMessage.isNotEmpty) ...[
                     const SizedBox(height: 8),
                     Text(
-                      _statusMessage,
-                      style: const TextStyle(
-                        color: Colors.cyanAccent,
+                      _statusMessage.startsWith('❌') 
+                          ? _statusMessage 
+                          : _statusMessage,
+                      style: TextStyle(
+                        color: _statusMessage.startsWith('❌') 
+                            ? Colors.redAccent 
+                            : Colors.cyanAccent,
                         fontSize: 14,
                         fontWeight: FontWeight.bold,
                       ),
@@ -529,42 +609,59 @@ class _DebugViewState extends State<DebugView> {
             bottom: 40,
             left: 20,
             right: 20,
-            child: Row(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _isEnrolling || _faces.isEmpty ? null : _enrollFace,
-                    icon: _isEnrolling
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                          )
-                        : const Icon(Icons.person_add),
-                    label: const Text('ENROLL'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF00F5D4),
-                      foregroundColor: Colors.black,
-                      padding: const EdgeInsets.symmetric(vertical: 16),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _isEnrolling || _faces.isEmpty ? null : _enrollFace,
+                        icon: _isEnrolling
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                              )
+                            : const Icon(Icons.person_add),
+                        label: const Text('ENROLL'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF00F5D4),
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                        ),
+                      ),
                     ),
-                  ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: _isVerifying || _faces.isEmpty ? null : _verifyFace,
+                        icon: _isVerifying
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                              )
+                            : const Icon(Icons.verified_user),
+                        label: const Text('VERIFY'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.greenAccent,
+                          foregroundColor: Colors.black,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-                const SizedBox(width: 16),
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed: _isVerifying || _faces.isEmpty ? null : _verifyFace,
-                    icon: _isVerifying
-                        ? const SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                          )
-                        : const Icon(Icons.verified_user),
-                    label: const Text('VERIFY'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.greenAccent,
-                      foregroundColor: Colors.black,
-                      padding: const EdgeInsets.symmetric(vertical: 16),
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: TextButton.icon(
+                    onPressed: _clearAllEnrollments,
+                    icon: const Icon(Icons.delete_forever, size: 18),
+                    label: const Text('Clear All Enrolled Faces'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.redAccent,
                     ),
                   ),
                 ),
